@@ -128,6 +128,8 @@ const (
 	TraceMsgType = "TRACE"
 	// StartedMsgType for request start messages
 	StartedMsgType = "START"
+	// HangingMsgType for requests that did not finish within the hang threshold
+	HangingMsgType = "HANGING"
 	// DebugMsgType for debug output
 	DebugMsgType = "DEBUG"
 )
@@ -1081,6 +1083,11 @@ func sidekickMain(ctx *cli.Context) {
 	}
 	globalKeyPassword = ctx.GlobalString("key-password")
 	globalRequestTracing = globalTrace == "requests"
+	// The hang tracker is active with --trace requests (default threshold)
+	// or whenever --hang-threshold is set explicitly, in any trace mode.
+	if globalRequestTracing || ctx.IsSet("hang-threshold") {
+		globalHangTracker = newHangTracker(ctx.GlobalDuration("hang-threshold"))
+	}
 
 	tlsMaxVersion := uint16(tls.VersionTLS13)
 	switch tlsMax := ctx.GlobalString("tls-max"); tlsMax {
@@ -1322,6 +1329,11 @@ func main() {
 			Name:  "trace, t",
 			Usage: "enable request tracing - valid values are [all,application,minio,requests]; requests logs a start and a finish entry with a request id",
 			Value: "all",
+		},
+		cli.DurationFlag{
+			Name:  "hang-threshold",
+			Usage: "periodically report requests that have not finished within this duration (0 disables)",
+			Value: 30 * time.Second,
 		},
 		cli.BoolFlag{
 			Name:  "quiet, q",

@@ -67,6 +67,7 @@ FLAGS:
   --rr-dns-mode                       enable round-robin DNS mode
   --log, -l                           enable logging
   --trace value, -t value             enable request tracing - valid values are [all,application,minio,requests]; requests logs a start and a finish entry with a request id (default: "all")
+  --hang-threshold value              periodically report requests that have not finished within this duration (0 disables) (default: 30s)
   --quiet, -q                         disable console messages
   --json                              output sidekick logs and trace in json format
   --debug                             output verbose trace

@@ -290,6 +290,15 @@ func Trace(f http.HandlerFunc, logBody bool, w http.ResponseWriter, r *http.Requ
 		doStartTrace(start, backend)
 	}
 
+	// Register the request as in-flight so that the hang tracker can report
+	// it if it does not finish within the configured threshold. The tracker
+	// is nil when hang reporting is not enabled, so this is a no-op check
+	// in the common case.
+	if globalHangTracker != nil {
+		done := globalHangTracker.track(backend.endpoint, r.Method, r.URL.Path, r.URL.RawQuery, getSourceIP(r), requestID, rw.StartTime)
+		defer done()
+	}
+
 	f(rw, r)
 
 	rq := traceRequestInfo{
