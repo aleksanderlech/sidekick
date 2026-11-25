@@ -17,6 +17,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -229,6 +232,22 @@ func InternalTrace(req *http.Request, resp *http.Response, reqTime, respTime tim
 	return t
 }
 
+// requestIDLength is the length in hex chars of a generated request ID.
+const requestIDLength = 12
+
+// generateRequestID returns a short unique request identifier. It is derived
+// by hashing request attributes (method, URL, client, start time) together
+// with a random nonce, so that the start and finish entries of the same
+// request share the same ID, while different requests stay distinguishable.
+func generateRequestID(r *http.Request, startTime time.Time) string {
+	nonce := make([]byte, 8)
+	_, _ = rand.Read(nonce)
+	h := sha256.New()
+	fmt.Fprintf(h, "%s %s?%s %s %d", r.Method, r.URL.Path, r.URL.RawQuery, getSourceIP(r), startTime.UnixNano())
+	h.Write(nonce)
+	return hex.EncodeToString(h.Sum(nil))[:requestIDLength]
+}
+
 // Trace gets trace of http request
 func Trace(f http.HandlerFunc, logBody bool, w http.ResponseWriter, r *http.Request, backend *Backend) TraceInfo {
 	// Setup a http request body recorder
@@ -248,6 +267,29 @@ func Trace(f http.HandlerFunc, logBody bool, w http.ResponseWriter, r *http.Requ
 
 	rw := NewResponseWriter(w)
 	rw.LogBody = logBody
+
+	var requestID string
+	if globalRequestTracing {
+		requestID = generateRequestID(r, rw.StartTime)
+
+		// Emit a start entry before the request is forwarded to the backend,
+		// so that in-flight requests are visible in the log as well.
+		start := TraceInfo{
+			Type:      StartedMsgType,
+			NodeName:  backend.endpoint,
+			RequestID: requestID,
+			ReqInfo: traceRequestInfo{
+				Time:     rw.StartTime,
+				Method:   r.Method,
+				Path:     r.URL.Path,
+				RawQuery: r.URL.RawQuery,
+				Client:   getSourceIP(r),
+				Headers:  reqHeaders,
+			},
+		}
+		doStartTrace(start, backend)
+	}
+
 	f(rw, r)
 
 	rq := traceRequestInfo{
@@ -273,6 +315,7 @@ func Trace(f http.HandlerFunc, logBody bool, w http.ResponseWriter, r *http.Requ
 	t.ReqInfo = rq
 	t.RespInfo = rs
 	t.NodeName = backend.endpoint
+	t.RequestID = requestID
 	t.CallStats = traceCallStats{
 		Latency:         rs.Time.Sub(rw.StartTime),
 		Rx:              reqBodyRecorder.Size(),
@@ -295,7 +338,16 @@ func httpTraceHdrs(f http.HandlerFunc, w http.ResponseWriter, r *http.Request, b
 func doTrace(trace TraceInfo, backend *Backend) {
 	st := shortTrace(trace)
 	defer backend.updateCallStats(st)
+	logTrace(trace, st, backend)
+}
 
+// doStartTrace logs a request start entry. It intentionally does not
+// update the call stats, since the request has not finished yet.
+func doStartTrace(trace TraceInfo, backend *Backend) {
+	logTrace(trace, shortTrace(trace), backend)
+}
+
+func logTrace(trace TraceInfo, st shortTraceMsg, backend *Backend) {
 	if globalQuietEnabled || globalTrace == "" {
 		return
 	}
@@ -304,13 +356,17 @@ func doTrace(trace TraceInfo, backend *Backend) {
 		return
 	}
 
-	if globalErrorsOnly && (st.StatusCode < 400 || st.StatusCode >= 600) {
-		return
-	}
-
-	if len(globalStatusCodes) > 0 {
-		if !slices.Contains(globalStatusCodes, st.StatusCode) {
+	// Status code based filters only apply to finished requests,
+	// since no response is available for a start entry.
+	if !st.IsStart {
+		if globalErrorsOnly && (st.StatusCode < 400 || st.StatusCode >= 600) {
 			return
+		}
+
+		if len(globalStatusCodes) > 0 {
+			if !slices.Contains(globalStatusCodes, st.StatusCode) {
+				return
+			}
 		}
 	}
 
@@ -351,6 +407,7 @@ func doTrace(trace TraceInfo, backend *Backend) {
 type TraceInfo struct {
 	Type      string            `json:"type"`
 	NodeName  string            `json:"nodename"`
+	RequestID string            `json:"requestId,omitempty"`
 	ReqInfo   traceRequestInfo  `json:"request"`
 	RespInfo  traceResponseInfo `json:"response"`
 	CallStats traceCallStats    `json:"stats"`
@@ -362,23 +419,31 @@ type shortTraceMsg struct {
 	Host       string         `json:"host"`
 	Time       time.Time      `json:"time"`
 	Client     string         `json:"client"`
+	RequestID  string         `json:"requestId,omitempty"`
 	CallStats  traceCallStats `json:"callStats"`
 	StatusCode int            `json:"statusCode"`
 	StatusMsg  string         `json:"statusMsg"`
 	Method     string         `json:"method"`
 	Path       string         `json:"path"`
 	Query      string         `json:"query"`
+	// IsStart indicates that the record was emitted when the request
+	// started, before any response is available.
+	IsStart bool `json:"isStart,omitempty"`
 }
 
 func (s shortTraceMsg) String() string {
 	b := &strings.Builder{}
 	fmt.Fprintf(b, " %5s: ", LogMsgType)
 	fmt.Fprintf(b, "%s ", s.Time.Format(timeFormat))
-	statusStr := console.Colorize("RespStatus", fmt.Sprintf("%d %s", s.StatusCode, s.StatusMsg))
-	if s.StatusCode >= http.StatusBadRequest {
-		statusStr = console.Colorize("ErrStatus", fmt.Sprintf("%d %s", s.StatusCode, s.StatusMsg))
+	if s.IsStart {
+		fmt.Fprintf(b, "[%s] ", console.Colorize("TraceMsgType", StartedMsgType))
+	} else {
+		statusStr := console.Colorize("RespStatus", fmt.Sprintf("%d %s", s.StatusCode, s.StatusMsg))
+		if s.StatusCode >= http.StatusBadRequest {
+			statusStr = console.Colorize("ErrStatus", fmt.Sprintf("%d %s", s.StatusCode, s.StatusMsg))
+		}
+		fmt.Fprintf(b, "[%s] ", statusStr)
 	}
-	fmt.Fprintf(b, "[%s] ", statusStr)
 	fmt.Fprintf(b, " %s ", s.Host)
 
 	if s.Query != "" {
@@ -387,6 +452,13 @@ func (s shortTraceMsg) String() string {
 		fmt.Fprintf(b, "%s %s", s.Method, s.Path)
 	}
 	fmt.Fprintf(b, " %s ", s.Client)
+	if s.RequestID != "" {
+		fmt.Fprintf(b, "%s ", s.RequestID)
+	}
+	if s.IsStart {
+		// No latency or byte counts are available at request start.
+		return b.String()
+	}
 	spaces := 15 - len(s.Client)
 	fmt.Fprintf(b, "%*s", spaces, " ")
 	fmt.Fprint(b, console.Colorize("HeaderValue", fmt.Sprintf("  %2s", s.CallStats.Latency.Round(time.Microsecond).String())))
@@ -418,10 +490,15 @@ func shortTrace(t TraceInfo) shortTraceMsg {
 	s.Path = t.ReqInfo.Path
 	s.Query = t.ReqInfo.RawQuery
 	s.Method = t.ReqInfo.Method
+	s.RequestID = t.RequestID
+	s.IsStart = t.Type == StartedMsgType
 	return s
 }
 
 func (trc TraceInfo) String() string {
+	if trc.Type == StartedMsgType {
+		return trc.startString()
+	}
 	var nodeNameStr string
 	b := &strings.Builder{}
 
@@ -432,7 +509,11 @@ func (trc TraceInfo) String() string {
 	ri := trc.ReqInfo
 	rs := trc.RespInfo
 	fmt.Fprintf(b, "%s%s", nodeNameStr, console.Colorize("Request", "[REQUEST] "))
-	fmt.Fprintf(b, "%s\n", ri.Time.Format(timeFormat))
+	fmt.Fprintf(b, "%s", ri.Time.Format(timeFormat))
+	if trc.RequestID != "" {
+		fmt.Fprintf(b, " %s", trc.RequestID)
+	}
+	fmt.Fprint(b, "\n")
 	fmt.Fprintf(b, "%s%s", nodeNameStr, console.Colorize("Method", fmt.Sprintf("%s %s", ri.Method, ri.Path)))
 	if ri.RawQuery != "" {
 		fmt.Fprintf(b, "?%s", ri.RawQuery)
@@ -465,6 +546,42 @@ func (trc TraceInfo) String() string {
 			fmt.Sprintf("%s: ", k))+console.Colorize("HeaderValue", fmt.Sprintf("%s\n", strings.Join(v, ""))))
 	}
 	fmt.Fprintf(b, "%s%s\n", nodeNameStr, console.Colorize("Body", rs.Body))
+	fmt.Fprint(b, nodeNameStr)
+	return b.String()
+}
+
+// startString returns the text representation of a request start record,
+// i.e. only the request part, since no response is available yet.
+func (trc TraceInfo) startString() string {
+	var nodeNameStr string
+	b := &strings.Builder{}
+
+	if trc.NodeName != "" {
+		nodeNameStr = fmt.Sprintf("%s: %s ", console.Colorize("TraceMsgType", StartedMsgType), trc.NodeName)
+	}
+
+	ri := trc.ReqInfo
+	fmt.Fprintf(b, "%s%s", nodeNameStr, console.Colorize("Request", "[REQUEST] "))
+	fmt.Fprintf(b, "%s", ri.Time.Format(timeFormat))
+	if trc.RequestID != "" {
+		fmt.Fprintf(b, " %s", trc.RequestID)
+	}
+	fmt.Fprint(b, "\n")
+	fmt.Fprintf(b, "%s%s", nodeNameStr, console.Colorize("Method", fmt.Sprintf("%s %s", ri.Method, ri.Path)))
+	if ri.RawQuery != "" {
+		fmt.Fprintf(b, "?%s", ri.RawQuery)
+	}
+	fmt.Fprint(b, "\n")
+	host, ok := ri.Headers["Host"]
+	if ok {
+		delete(ri.Headers, "Host")
+	}
+	hostStr := strings.Join(host, "")
+	fmt.Fprintf(b, "%s%s", nodeNameStr, console.Colorize("Host", fmt.Sprintf("Host: %s\n", hostStr)))
+	for k, v := range ri.Headers {
+		fmt.Fprintf(b, "%s%s", nodeNameStr, console.Colorize("ReqHeaderKey",
+			fmt.Sprintf("%s: ", k))+console.Colorize("HeaderValue", fmt.Sprintf("%s\n", strings.Join(v, ""))))
+	}
 	fmt.Fprint(b, nodeNameStr)
 	return b.String()
 }

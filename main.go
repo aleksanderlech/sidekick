@@ -83,6 +83,7 @@ var (
 	globalHostBalance    string
 	globalTLSCert        atomic.Pointer[[]byte]
 	globalKeyPassword    string
+	globalRequestTracing bool
 )
 
 const (
@@ -125,6 +126,8 @@ const (
 	LogMsgType = "LOG"
 	// TraceMsgType for trace messages
 	TraceMsgType = "TRACE"
+	// StartedMsgType for request start messages
+	StartedMsgType = "START"
 	// DebugMsgType for debug output
 	DebugMsgType = "DEBUG"
 )
@@ -419,7 +422,9 @@ func (b *Backend) doHealthCheck() error {
 		b.setOnline()
 	}
 
-	if globalTrace != "application" {
+	// "requests" mode traces only proxied requests (with start and finish
+	// entries), not health checks.
+	if globalTrace != "application" && globalTrace != "requests" {
 		if resp != nil {
 			traceHealthCheckReq(req, resp, reqTime, respTime, b, err)
 		}
@@ -1075,6 +1080,7 @@ func sidekickMain(ctx *cli.Context) {
 		globalHostBalance = "least"
 	}
 	globalKeyPassword = ctx.GlobalString("key-password")
+	globalRequestTracing = globalTrace == "requests"
 
 	tlsMaxVersion := uint16(tls.VersionTLS13)
 	switch tlsMax := ctx.GlobalString("tls-max"); tlsMax {
@@ -1314,7 +1320,7 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "trace, t",
-			Usage: "enable request tracing - valid values are [all,application,minio]",
+			Usage: "enable request tracing - valid values are [all,application,minio,requests]; requests logs a start and a finish entry with a request id",
 			Value: "all",
 		},
 		cli.BoolFlag{
